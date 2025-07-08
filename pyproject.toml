@@ -1,0 +1,13 @@
+[project]
+name = "scp-zip"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bs4>=0.0.2",
+    "httpx>=0.28.1",
+    "libzim>=3.7.0",
+    "requests>=2.32.4",
+    "warcio>=1.7.5",
+]
