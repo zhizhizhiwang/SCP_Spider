@@ -1,0 +1,3 @@
+libzim
+httpx
+beautifulsoup4

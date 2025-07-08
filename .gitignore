@@ -1,0 +1,7 @@
+*.log
+*.tmp
+config.json
+*.zim
+*.zip
+*.exe
+dist/*
