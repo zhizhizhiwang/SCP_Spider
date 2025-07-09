@@ -12,6 +12,7 @@ from typing import Any
 from dataclasses import dataclass, asdict, field
 import csv
 from pathlib import Path
+import time
 
 # libzim 相关导入
 from libzim.writer import (  # pyright: ignore[reportMissingModuleSource]
@@ -185,7 +186,7 @@ class WebCrawler:
                     parsed_url = urlparse(full_url)
 
                     # 处理内部链接
-                    if parsed_url.netloc.endswith(self.searching_domain):
+                    if parsed_url.netloc.startswith(urlparse((f'https://{self.searching_domain}')).netloc):
                         if tag == "a":
                             # 页面链接
                             new_urls.add(full_url)
@@ -380,7 +381,7 @@ class WebCrawler:
         return [asdict(result) for result in self.results]
 
     def save_results(self, results: list[dict[str, Any]] = None) -> None:
-        """保存结果到文件"""
+        """保存结果到JSON文件"""
         if results is None:
             results = [asdict(result) for result in self.results]
 
@@ -437,7 +438,7 @@ class WebCrawler:
 
         try:
             
-            zim_creator = Creator(Path(output_file.replace(r'/', '-')))
+            zim_creator = Creator(Path(output_file))
             
             # 启动Creator上下文（所有操作必须在with块内完成）
             with zim_creator as creator:
@@ -531,14 +532,13 @@ async def main():
     )
 
     results = await crawler.crawl()
-    crawler.save_results(results)
 
     # 尝试保存为ZIM文件
-    zim_filename = f"{searching_domain.replace(".", "_")}.zim"
+    zim_filename = f"{searching_domain.replace(".", "_").replace(r'/', '_')}-{time.strftime('%Y-%m-%d_%H-%M-%S')}.zim"
     crawler.save_to_zim(
         output_file=zim_filename,
         title=f"{searching_domain} 爬虫存档",
-        description=f"{searching_domain} 网站的离线存档，由SCP_Spider创建",
+        description=f"{searching_domain} 网站的离线存档, 由SCP_Spider创建",
         creator_meta="SCP_Spider",
     )
 
