@@ -13,6 +13,7 @@ from dataclasses import dataclass, asdict, field
 import csv
 from pathlib import Path
 import time
+import re
 
 # libzim 相关导入
 from libzim.writer import (  # pyright: ignore[reportMissingModuleSource]
@@ -77,7 +78,7 @@ class CrawlResult:
     remark: str
     status_code: int
     text: str = ""
-    content: bytes = field(default=b"", repr=False)
+    content: bytes | str = field(default=b"", repr=False)
     mimetype: str = "text/html"
     is_resource: bool = False
 
@@ -148,11 +149,13 @@ class WebCrawler:
         )
 
         self.target_urls: set[str] = {f"https://{searching_domain}"}
+        self.start_domain = urlparse((f'https://{searching_domain}'))
         self.accessed_urls: set[str] = set()
         self.results: list[CrawlResult] = []
         self.resource_urls: set[str] = set()  # 存储需要获取的资源URL
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self._url_lock = asyncio.Lock()
+        self.url_map : dict[str, str] = {} # 资源的url映射
 
     def find_urls(self, url: str, response_text: str) -> tuple[set[str], set[str]]:
         """从HTML响应中提取所有链接和资源
@@ -170,7 +173,7 @@ class WebCrawler:
                 ("a", "href"),  # 页面链接
                 ("img", "src"),  # 图片
                 ("script", "src"),  # JS
-                ("link", "href"),  # CSS
+                ("link", "href"),  # CSS 
                 ("source", "src"),  # 媒体元素
                 ("video", "src"),  # 视频
                 ("audio", "src"),  # 音频
@@ -186,7 +189,8 @@ class WebCrawler:
                     parsed_url = urlparse(full_url)
 
                     # 处理内部链接
-                    if parsed_url.netloc.startswith(urlparse((f'https://{self.searching_domain}')).netloc):
+                    # if parsed_url.netloc.startswith(urlparse((f'https://{self.searching_domain}')).netloc):
+                    if(parsed_url.netloc == self.start_domain.netloc and parsed_url.path.startswith(self.start_domain.path)):
                         if tag == "a":
                             # 页面链接
                             new_urls.add(full_url)
@@ -202,7 +206,10 @@ class WebCrawler:
                     ):
                         # 外部资源（非链接）
                         resource_urls.add(full_url)
-
+            for element in soup.find_all("style"): # <style> url('') </style> 处理
+                regex = r"url\(['\"]([^'\"]+)['\"]\)"
+                for match in re.findall(regex, str(element)):
+                    resource_urls.add(match) if urlparse(match).netloc != '' else resource_urls.add(urljoin(base_url, match))
         except Exception as e:
             logging.error(f"Error parsing URLs from {url}: {e}")
 
@@ -349,7 +356,7 @@ class WebCrawler:
                         f"URLs: {progress:.2f}%, {len(self.accessed_urls)}/{total_urls}"
                     )
 
-            # 第二阶段：爬取资源文件（如果启用）
+            # 第二阶段：爬取资源文件
             if self.fetch_resources:
                 logging.info(
                     f"Starting to fetch resource files: {len(self.resource_urls)} files"
@@ -466,7 +473,7 @@ class WebCrawler:
                         continue
 
                     # 生成ZIM路径（与原逻辑相同）
-                    parsed_url = urlparse(result.url)
+                    '''parsed_url = urlparse(result.url)
                     path = parsed_url.path
                     if not path or path == "/":
                         path = "/index.html"
@@ -474,7 +481,11 @@ class WebCrawler:
                         path = path.rstrip("/") + "/index.html"
                     if path.startswith("/"):
                         path = path[1:]
-                    logging.debug(f'生成路径：{path}')
+                    if '#' in result.url:
+                        path = f'{path}#{result.url.split("#")[-1]}'
+                    '''
+                    path = result.url.replace('https://', '').replace('http://', '')
+                    logging.info(f'生成路径：{path}')
 
                     # 创建条目并添加
                     content_provider = StringProvider(result.content)
@@ -500,14 +511,14 @@ class WebCrawler:
                     # 添加索引页
                     index_content_provider = StringProvider(index_content.encode("utf-8"))
                     index_item = Item()
-                    index_item.get_path = lambda: "index.html"
+                    index_item.get_path = lambda: f"index.html"
                     index_item.get_title = lambda: "索引"
                     index_item.get_mimetype = lambda: "text/html"
                     index_item.get_contentprovider = lambda: index_content_provider
                     index_item.get_hints = lambda: {Hint.FRONT_ARTICLE: True}
                     creator.add_item(index_item)  # 在上下文中添加
                 except Exception as e:
-                    logging.warning(f"索引已经存在: {e}")
+                    logging.error(f"索引已经存在: {e}")
 
             # 上下文退出时会自动完成ZIM文件写入
             logging.info(f"ZIM文件创建成功：{output_file}，包含{page_count}个页面和{file_count}个资源文件")
@@ -519,10 +530,10 @@ class WebCrawler:
 
 async def main():
     """主函数"""
-    searching_domain = "scp-wiki-cn.wikidot.com/offline"
+    searching_domain = "scp-wiki-cn.wikidot.com/cytus-3"
 
     crawler = WebCrawler(
-        searching_domain=searching_domain,
+        searching_domain=searching_domain.replace("https://", "").replace("http://", ""),
         max_retries=3,
         waiting_seconds_if_error=3.0,
         max_concurrent=10,
