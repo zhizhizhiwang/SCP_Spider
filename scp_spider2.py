@@ -15,6 +15,8 @@ from pathlib import Path
 import time
 import re
 import traceback
+from typing import Tuple, List, Dict, Set
+
 
 # libzim 相关导入
 from libzim.writer import (  # pyright: ignore[reportMissingModuleSource]
@@ -58,18 +60,9 @@ def get_mimetype(url: str) -> str:
 
 def is_resource_file(url: str) -> bool:
     """判断URL是否为资源文件（图片、CSS、JS等）"""
-    extensions = (
-        ".css",
-        ".js",
-        ".png",
-        ".jpg",
-        ".gif",
-        ".jpeg",
-        ".svg",
-        ".ico",
-        ".webp",
-    )
-    return any(url.lower().endswith(ext) for ext in extensions)
+    # logging.info(f'判定{url}类型为{['资源', '页面']['html' in get_mimetype(url)]}')
+    return not 'html' in get_mimetype(url) 
+
 
 
 @dataclass
@@ -81,6 +74,26 @@ class CrawlResult:
     content: str | bytes = ''
     mimetype: str = "text/html"
     is_resource: bool = False
+    
+REWRITE_PREFIX = ''
+
+def rewrite_url(url: str, base: str) -> str:
+    """
+    重写URL的规则函数。
+    该函数重写所有有效的URL，无论内部还是外部。
+    """
+    # 1. 忽略空的、data: URI或锚点链接
+    if not url or url.startswith(('data:', '#', 'javascript:')):
+        return url
+    # scp-wiki-cn.wikidot.com/cytus-3 的base环境实际上是 scp-wiki-cn.wikidot.com, 需要回退一个path层
+    real_base = '/'.join(base.split('/')[0:-1])
+    # logging.info(f'base环境是{real_base}')
+
+    absolute_original_url = urljoin(base, url)
+    parsed_url = urlparse(os.path.relpath(absolute_original_url, real_base).replace('\\', '/'))
+    
+    return REWRITE_PREFIX + f'{parsed_url.netloc}{parsed_url.path}{'#' if parsed_url.fragment else ''}{parsed_url.fragment}{'?' if parsed_url.query else ''}{parsed_url.query}'
+
 
 
 class WebCrawler:
@@ -157,63 +170,156 @@ class WebCrawler:
         self._url_lock = asyncio.Lock()
         self.url_map : dict[str, str] = {} # 资源的url映射
 
-    def find_urls(self, url: str, response_text: str) -> tuple[set[str], set[str]]:
-        """从HTML响应中提取所有链接和资源
-
-        返回：
-            (页面链接, 资源链接)
+    def process_html(self, html_content: str, baseurl: str):
         """
-        new_urls = set()
+        主处理函数，解析、统计和重写HTML中的所有资源。
+        """
+        soup = BeautifulSoup(html_content, 'lxml')
         resource_urls = set()
-        try:
-            soup = BeautifulSoup(response_text, "html.parser")
-            base_url = url
+        new_urls = set()
+        
+        def add_url(url:str):
+            if is_resource_file(url):
+                resource_urls.add(urljoin(baseurl, url))
+            else:
+                new_urls.add(urljoin(baseurl, url))
 
-            tags_attrs = [
-                ("a", "href"),  # 页面链接
-                ("img", "src"),  # 图片
-                ("script", "src"),  # JS
-                ("link", "href"),  # CSS 
-                ("source", "src"),  # 媒体元素
-                ("video", "src"),  # 视频
-                ("audio", "src"),  # 音频
-            ]
+        # --- 1. 处理常见的HTML标签 ---
+        tag_attrs = {
+            'link': ['href'], 'script': ['src'], 'img': ['src', 'srcset'],
+            'audio': ['src'], 'video': ['src', 'poster'], 'source': ['src', 'srcset'],
+            'iframe': ['src'], 'embed': ['src'], 'object': ['data'],
+        }
 
-            for tag, attr in tags_attrs:
-                for element in soup.find_all(tag):
-                    link = element.get(attr)
-                    if not link:
-                        continue
+        for tag_name, attrs in tag_attrs.items():
+            for tag in soup.find_all(tag_name):
+                for attr in attrs:
+                    if tag.has_attr(attr):
+                        original_url_attr = tag[attr]
+                        
+                        if attr == 'srcset':
+                            new_srcset_parts = []
+                            for part in original_url_attr.split(','):
+                                part = part.strip()
+                                if not part: continue
+                                url_part, *descriptor = part.split(None, 1)
+                                add_url(url_part)
+                                rewritten = rewrite_url(url_part, baseurl)
+                                new_srcset_parts.append(f"{rewritten} {' '.join(descriptor)}")
+                            tag[attr] = ', '.join(new_srcset_parts)
+                        else:
+                            add_url(original_url_attr)
+                            tag[attr] = rewrite_url(original_url_attr, baseurl)
 
-                    full_url = urljoin(base_url, link)
-                    parsed_url = urlparse(full_url)
+        # --- 2. 处理CSS中的url() ---
+        def create_rewriter_callback(is_js=False):
+            def rewriter(match):
+                # JS正则可能捕获引号，CSS不会
+                group_index = 2 if is_js else 1
+                quote = match.group(1) if is_js else "'"
+                
+                original_url = match.group(group_index).strip("'\"")
+                add_url(original_url)
+                rewritten_url = rewrite_url(original_url, baseurl)
+                
+                if is_js:
+                    return f"{quote}{rewritten_url}{quote}"
+                else:
+                    return f"url('{rewritten_url}')"
+            return rewriter
 
-                    # 处理内部链接
-                    # if parsed_url.netloc.startswith(urlparse((f'https://{self.searching_domain}')).netloc):
-                    if(parsed_url.netloc == self.start_domain.netloc and parsed_url.path.startswith(self.start_domain.path)):
-                        if tag == "a":
-                            # 页面链接
-                            new_urls.add(full_url)
-                        elif self.fetch_resources and is_resource_file(full_url):
-                            # 内部资源
-                            resource_urls.add(full_url)
+        for style_tag in soup.find_all('style'):
+            if style_tag.string:
+                style_tag.string = re.sub(r'url\((.*?)\)', create_rewriter_callback(), style_tag.string)
 
-                    # 处理外部资源（如果启用）
-                    elif (
-                        self.fetch_resources
-                        and tag != "a"
-                        and is_resource_file(full_url)
-                    ):
-                        # 外部资源（非链接）
-                        resource_urls.add(full_url)
-            for element in soup.find_all("style"): # <style> url('') </style> 处理
-                regex = r"url\(['\"]([^'\"]+)['\"]\)"
-                for match in re.findall(regex, str(element)):
-                    resource_urls.add(match) if urlparse(match).netloc != '' else resource_urls.add(urljoin(base_url, match))
-        except Exception as e:
-            logging.error(f"Error parsing URLs from {url}: {e}")
+        for tag in soup.find_all(style=True):
+            tag['style'] = re.sub(r'url\((.*?)\)', create_rewriter_callback(), tag['style'])
 
-        return new_urls, resource_urls
+        # --- 3. 处理JavaScript中的链接 (简单情况) ---
+        for script_tag in soup.find_all('script'):
+            if script_tag.string:
+                # 改进正则以更好地处理简单字符串
+                new_js = re.sub(r'(["\'])((?:/|https?://|./|../).*?)\1', create_rewriter_callback(is_js=True), script_tag.string)
+                script_tag.string = new_js
+        logging.info(f"在{baseurl}找到了{len(resource_urls)}个资源链接, {len(new_urls)}个页面链接")
+        return soup.prettify(), resource_urls, new_urls
+
+    def process_css_content(
+        self,
+        css_content: str, 
+        css_base_url: str, 
+    ) -> Tuple[str, Set[str], Set[str]]:
+        """
+        处理CSS内容，重写其中的链接，并返回重写后的内容和找到的原始URL列表。
+
+        Args:
+            css_content (str): 要处理的CSS代码字符串。
+            css_base_url (str): 该CSS文件的绝对URL，用于解析相对路径。
+
+        Returns:
+            Tuple[str, Set[str], Set[str]]: 
+                - 第一个元素是重写了所有链接后的新CSS内容。
+                - 第二个元素是在CSS中找到的所有资源URL（绝对路径形式）的列表。
+                - 第三个元素是在CSS中找到的所有页面URL（绝对路径形式）的列表。
+        """
+        
+        resource_urls = set()
+        new_urls = set()
+        
+        def add_url(url:str):
+            if is_resource_file(url):
+                resource_urls.add(urljoin(css_base_url, url))
+            else:
+                new_urls.add(urljoin(css_base_url, url))
+
+        # 1. 处理 @import "..." 或 @import url(...)
+        def import_replacer(match: re.Match) -> str:
+            # group(1) 匹配 url(...) 中的内容, group(2) 匹配 "..." 中的内容
+            original_url = (match.group(1) or match.group(2)).strip("'\"")
+            
+            # 忽略空URL
+            if not original_url:
+                return match.group(0)
+
+            # 将相对URL转换为绝对URL
+            absolute_url = urljoin(css_base_url, original_url)
+            add_url(absolute_url)
+            
+            # 从 rewrite_map 中查找重写后的URL，如果找不到则保持原样
+            rewritten_url = rewrite_url(original_url, css_base_url)
+            
+            # 返回标准格式的 @import
+            return f'@import url("{rewritten_url}");'
+
+        # 正则表达式匹配 @import 规则
+        # @import url(path) or @import "path" or @import 'path'
+        import_pattern = re.compile(r'@import\s+(?:url\((.*?)\)|["\'](.*?)["\']);?', re.IGNORECASE)
+        modified_content = import_pattern.sub(import_replacer, css_content)
+
+        # 2. 处理 url(...)
+        def url_replacer(match: re.Match) -> str:
+            original_url = match.group(1).strip("'\"")
+
+            # 忽略空的、data: URI 或锚点
+            if not original_url or original_url.startswith(('data:', '#')):
+                return match.group(0)
+                
+            absolute_url = urljoin(css_base_url, original_url)
+            add_url(absolute_url)
+
+            rewritten_url = rewrite_url(original_url, css_base_url)
+            
+            # 返回标准格式的 url()
+            # 注意对URL中的特殊字符（如引号）进行转义，以防破坏CSS语法
+            escaped_rewritten_url = rewritten_url.replace('"', '\\"')
+            return f'url("{escaped_rewritten_url}")'
+
+        # 正则表达式匹配 url() 函数
+        url_pattern = re.compile(r'url\((.*?)\)', re.IGNORECASE)
+        modified_content = url_pattern.sub(url_replacer, modified_content)
+        logging.info(f"在{css_base_url}找到了{len(resource_urls)}个资源链接 {len(new_urls)}个页面链接")
+
+        return modified_content, resource_urls, new_urls
 
     async def _process_single_url(
         self, client: httpx.AsyncClient, url: str, is_resource: bool = False
@@ -267,7 +373,6 @@ class WebCrawler:
                             return
                     else:
                         await asyncio.sleep(self.waiting_seconds_if_error)
-
             if response:
                 # 获取MIME类型
                 content_type = response.headers.get("content-type", "")
@@ -282,33 +387,43 @@ class WebCrawler:
 
                 # 资源文件和HTML页面的处理方式不同
                 if is_resource:
-                    # 资源文件保存二进制内容, css和js存文本
+                    # 资源文件保存二进制内容
                     result = CrawlResult(
                         url=url.replace('https://', '').replace('http://', ''),
                         success=response.is_success,
                         remark=remark,
                         status_code=response.status_code,
                         content=(
-                            response.text if mimetype in ('text/css', 'text/javascript') else (response.content if self.store_resource_content else "")
+                            response.content if self.store_resource_content else ""
                         ),
                         mimetype=mimetype,
                         is_resource=True,
                     )
-                else:
                     
-                    # HTML页面保存文本内容
+                    if(mimetype == 'text/css' or 'javascript' in mimetype):
+                        re_comment, new_resource_urls, new_urls = self.process_css_content(response.text, url)
+                        async with self._url_lock:
+                            # 只添加未访问的URL
+                            self.target_urls.update(new_urls - self.accessed_urls)
+                            # 添加新的资源URL
+                            self.resource_urls.update(
+                                new_resource_urls - self.accessed_urls
+                            )
+                        result.content = re_comment
+                else:
+
+                    # 提取新URL和资源URL
+                    re_comment, new_resource_urls, new_urls = self.process_html(response.text, url)
+                    
                     result = CrawlResult(
                         url=url,
                         success=response.is_success,
                         remark=remark,
                         status_code=response.status_code,
-                        content=response.text,  
+                        content=re_comment,  
                         mimetype=mimetype,
                         is_resource=False,
                     )
-                    
-                    # 提取新URL和资源URL
-                    new_urls, new_resource_urls = self.find_urls(url, response.text)
                     async with self._url_lock:
                         # 只添加未访问的URL
                         self.target_urls.update(new_urls - self.accessed_urls)
@@ -384,47 +499,6 @@ class WebCrawler:
         logging.info("Finished crawling")
         return [asdict(result) for result in self.results]
 
-    def save_results(self, results: list[dict[str, Any]] = None) -> None:
-        """保存结果到JSON文件"""
-        if results is None:
-            results = [asdict(result) for result in self.results]
-
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        # 移除二进制内容以便JSON序列化
-        json_results = []
-        for result in results:
-            result_copy = result.copy()
-            # 移除二进制内容字段
-            if "content" in result_copy:
-                result_copy["content"] = (
-                    f"<{len(result_copy.get('content', b''))} bytes>"
-                )
-            json_results.append(result_copy)
-
-        # 尝试保存为JSON
-        try:
-            filename = f"results_{timestamp}.json"
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(json_results, f, indent=2, ensure_ascii=False)
-            logging.info(f"Results saved to {filename}")
-        except Exception as e:
-            logging.error(f"Error saving results as JSON: {e}")
-            self._save_as_csv(json_results, timestamp)
-
-    def _save_as_csv(self, results: list[dict[str, Any]], timestamp: str) -> None:
-        """保存结果为CSV格式"""
-        try:
-            filename = f"results_{timestamp}.csv"
-            with open(filename, "w", encoding="utf-8", newline="") as f:
-                if results:
-                    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-                    writer.writeheader()
-                    writer.writerows(results)
-            logging.info(f"Results saved to {filename}")
-        except Exception as e:
-            logging.error(f"Error saving results as CSV: {e}")
-
     def save_to_zim(
         self, output_file: str, title: str, description: str, creator_meta: str
     ) -> bool:
@@ -470,43 +544,24 @@ class WebCrawler:
                         continue
 
                     # 生成ZIM路径（与原逻辑相同）
-                    '''parsed_url = urlparse(result.url)
-                    path = parsed_url.path
-                    if not path or path == "/":
+                    # parsed_url = urlparse(result.url)
+                    path = result.url.replace('https://', '').replace('http://', '')
+                    '''if not path or path == "/":
                         path = "/index.html"
                     elif not path.endswith((".html", ".htm", ".css", ".js", ".jpg", ".png", ".gif")):
                         path = path.rstrip("/") + "/index.html"
                     if path.startswith("/"):
                         path = path[1:]
                     if '#' in result.url:
-                        path = f'{path}#{result.url.split("#")[-1]}'
-                    '''
-                    path = result.url.replace('https://', '').replace('http://', '')
+                        path = f'{path}#{result.url.split("#")[-1]}' '''
+                    
+                    # path = result.url.replace('https://', '').replace('http://', '')
 
 
                     # 创建条目并添加
                     item = Item()
-                    if(result.is_resource):
-                        item.get_path = lambda: path
-                        content_provider = StringProvider(result.content)
-                        item.get_contentprovider = lambda: content_provider
-                        # css专门处理
-                        if(result.mimetype == 'text/css'):
-                            for resource_url in self.resource_urls:
-                                if resource_url in result.content:
-                                    result.content = result.content.replace(
-                                        resource_url, f'../{urlparse(resource_url).netloc}{urlparse(resource_url).path}{'#' if urlparse(resource_url).fragment != '' else ''}{urlparse(resource_url).fragment}'
-                                )
-                    else:
-                        item.get_path = lambda: path
-                        # 进行资源url重写
-                        for resource_url in self.resource_urls:
-                            if resource_url in result.content:
-                                result.content = result.content.replace(
-                                    resource_url, f'../{urlparse(resource_url).netloc}{urlparse(resource_url).path}{'#' if urlparse(resource_url).fragment != '' else ''}{urlparse(resource_url).fragment}'
-                                )
-                        content_provider = StringProvider(result.content)
-                        item.get_contentprovider = lambda: content_provider
+                    item.get_path = lambda: path
+                    item.get_contentprovider = lambda: StringProvider(result.content)
                     item.get_title = lambda: result.url
                     item.get_mimetype = lambda: result.mimetype
                     item.get_hints = lambda: {Hint.COMPRESS: True}
@@ -527,7 +582,7 @@ class WebCrawler:
 
                 try:
                     # 添加索引页
-                    index_content_provider = StringProvider(index_content.encode("utf-8"))
+                    index_content_provider = StringProvider(index_content)
                     index_item = Item()
                     index_item.get_path = lambda: f"index.html"
                     index_item.get_title = lambda: "索引"
