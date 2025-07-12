@@ -3,7 +3,7 @@ import os
 import mimetypes
 from asyncio import sleep
 import httpx
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 import logging
 import json
@@ -335,6 +335,7 @@ class WebCrawler:
             if not is_resource:  # 只对网页做扩展名过滤
                 parsed_url = urlparse(url)
                 if os.path.splitext(parsed_url.path)[-1] in self.skipped_extensions:
+                    logging.info(f"跳过链接{url}")
                     return
 
             error = 0
@@ -546,15 +547,12 @@ class WebCrawler:
                     # 生成ZIM路径（与原逻辑相同）
                     # parsed_url = urlparse(result.url)
                     path = result.url.replace('https://', '').replace('http://', '')
-                    '''if not path or path == "/":
-                        path = "/index.html"
-                    elif not path.endswith((".html", ".htm", ".css", ".js", ".jpg", ".png", ".gif")):
-                        path = path.rstrip("/") + "/index.html"
-                    if path.startswith("/"):
-                        path = path[1:]
-                    if '#' in result.url:
-                        path = f'{path}#{result.url.split("#")[-1]}' '''
-                    
+                    '''
+                    @https://www.openzim.org/wiki/ZIM_file_format path章节
+                    path中的特殊字符保持原样
+                    #和?进行转义
+                    '''
+                    path = unquote(path).replace('#', '%23').replace('?', '%3F').replace('&', '%26').replace('=', '%3D')
                     # path = result.url.replace('https://', '').replace('http://', '')
 
 
@@ -604,8 +602,9 @@ class WebCrawler:
 
 async def main():
     """主函数"""
-    searching_domain = "scp-wiki-cn.wikidot.com/cytus-3"
-
+    #searching_domain = "scp-wiki-cn.wikidot.com/cytus-3"
+    searching_domain = "scp-wiki-cn.wikidot.com/scp-cn-3959"
+    
     crawler = WebCrawler(
         searching_domain=searching_domain.replace("https://", "").replace("http://", ""),
         max_retries=3,
