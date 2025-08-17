@@ -1,631 +1,475 @@
+# playwright_archiver.py
+# 一个使用Playwright动态捕获和静态内容重写的网站归档工具
 import asyncio
-import os
-import mimetypes
-from asyncio import sleep
-import httpx
-from urllib.parse import urljoin, urlparse, unquote
-from bs4 import BeautifulSoup
 import logging
-import json
-from datetime import datetime
-from typing import Any
-from dataclasses import dataclass, asdict, field
-import csv
-from pathlib import Path
-import time
+import os
 import re
-import traceback
-from typing import Tuple, List, Dict, Set
-
-
-# libzim 相关导入
-from libzim.writer import (  # pyright: ignore[reportMissingModuleSource]
-    Creator,
-    Item,
-    StringProvider,
-    Hint,
+import time
+import mimetypes
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urljoin, urlparse, unquote
+from typing import Dict, Set, Any, List, Tuple
+import json
+from bs4 import BeautifulSoup
+from playwright.async_api import (
+    async_playwright,
+    Page,
+    Route,
+    Request,
+    Response,
+    BrowserContext,
 )
+import pyjsparser
 
+# libzim 库导入，如果未安装则提供友好提示
+try:
+    
+    from libzim.writer import Creator, Item, StringProvider, Hint
+except ImportError:
+    logging.error(
+        "libzim 未找到。ZIM文件保存功能将不可用。\n"
+        "请通过 'pip install libzim' 安装。"
+    )
+    # 创建占位符，以防程序因缺少模块而崩溃
+    Creator = Item = StringProvider = Hint = object
+
+
+# --- 日志配置 ---
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] (%(module)s) %(message)s",
 )
 
 
+# --- 数据类定义 ---
+@dataclass
+class CrawlResult:
+    """存储单个捕获资源的所有信息"""
+
+    url: str
+    success: bool
+    status_code: int
+    mimetype: str
+
+    # content先保存为原始的bytes，在重写阶段再处理
+    content: bytes
+    remark: str = ""
+    is_resource: bool = False
+
+
+# --- 辅助函数 ---
 def get_mimetype(url: str) -> str:
-    """根据URL确定MIME类型"""
-    guess = mimetypes.guess_type(url)[0]
+    """根据URL后缀猜测MIME类型，作为备用方案"""
+    path = urlparse(url).path
+    guess, _ = mimetypes.guess_type(path)
     if guess:
         return guess
 
-    # 默认MIME类型
-    if url.endswith((".html", ".htm")):
-        return "text/html"
-    elif url.endswith(".css"):
-        return "text/css"
-    elif url.endswith(".js"):
-        return "application/javascript"
-    elif url.endswith((".jpg", ".jpeg")):
-        return "image/jpeg"
-    elif url.endswith(".png"):
-        return "image/png"
-    elif url.endswith(".gif"):
-        return "image/gif"
-    elif url.endswith(".svg"):
-        return "image/svg+xml"
-    elif url.endswith(".ico"):
-        return "image/x-icon"
-    else:
-        return "application/octet-stream"
+    ext_map = {
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".css": "text/css",
+        ".js": "application/javascript",
+        ".json": "application/json",
+        ".xml": "application/xml",
+        ".svg": "image/svg+xml",
+    }
+    _, ext = os.path.splitext(path)
+    return ext_map.get(ext.lower(), "application/octet-stream")
 
 
-def is_resource_file(url: str) -> bool:
-    """判断URL是否为资源文件（图片、CSS、JS等）"""
-    # logging.info(f'判定{url}类型为{['资源', '页面']['html' in get_mimetype(url)]}')
-    return not 'html' in get_mimetype(url) 
+def is_resource_file(mimetype: str) -> bool:
+    """根据MIME类型判断是否为页面（HTML）"""
+    return "html" not in mimetype
 
 
-
-@dataclass
-class CrawlResult:
-    url: str
-    success: bool
-    remark: str
-    status_code: int
-    content: str | bytes = ''
-    mimetype: str = "text/html"
-    is_resource: bool = False
-    
-REWRITE_PREFIX = ''
-
-def rewrite_url(url: str, base: str) -> str:
+def get_zim_path(url: str) -> str:
     """
-    重写URL的规则函数。
-    该函数重写所有有效的URL，无论内部还是外部。
+    根据原始URL，生成一个干净、唯一、适合作为ZIM文件系统路径的字符串。
+    格式：domain.com/path/to/resource
     """
-    # 1. 忽略空的、data: URI或锚点链接
-    if not url or url.startswith(('data:', '#', 'javascript:')):
-        return url
-    # scp-wiki-cn.wikidot.com/cytus-3 的base环境实际上是 scp-wiki-cn.wikidot.com, 需要回退一个path层
-    real_base = '/'.join(base.split('/')[0:-1])
-    # logging.info(f'base环境是{real_base}')
+    if not url or not url.startswith("http"):
+        return ""
 
-    absolute_original_url = urljoin(base, url)
-    parsed_url = urlparse(os.path.relpath(absolute_original_url, real_base).replace('\\', '/'))
+    parsed = urlparse(url)
+    # 移除查询参数和片段
+    path = parsed.path
+    # ZIM路径中不包含协议头
+    zim_path = f"{parsed.netloc}{path}"
+
+    # 规范化：移除尾部斜杠（除非是根目录），并为目录添加index.html
+    if len(zim_path) > 1 and zim_path.endswith("/"):
+        zim_path = zim_path[:-1]
     
-    return REWRITE_PREFIX + f'{parsed_url.netloc}{parsed_url.path}{'#' if parsed_url.fragment else ''}{parsed_url.fragment}{'?' if parsed_url.query else ''}{parsed_url.query}'
+    # 如果路径没有文件扩展名，很可能是一个目录，为其添加index.html
+    if not os.path.splitext(zim_path)[1] and not zim_path.endswith("index.html"):
+        zim_path += "/index.html"
+    
+    # ZIM路径中的特殊字符需要被unquote
+    return unquote(zim_path)
 
 
+# --- 核心爬虫类 ---
+class PlaywrightArchiver:
+    def __init__(self, start_url: str, max_concurrent_pages: int = 5):
+        self.start_url = start_url
+        self.start_domain = urlparse(start_url).netloc
+        self.max_concurrent_pages = max_concurrent_pages
+        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.processed_urls: Set[str] = set()
+        self.url_map: Dict[str, str] = {}
+        self.results: Dict[str, CrawlResult] = {}
+        self._lock = asyncio.Lock()
 
-class WebCrawler:
-    def __init__(
-        self,
-        searching_domain: str,
-        max_retries: int = 3,
-        waiting_seconds_if_error: float = 3.0,
-        max_concurrent: int = 10,
-        store_response_text: bool = True,
-        fetch_resources: bool = True,
-        store_resource_content: bool = True,
-    ):
-        self.searching_domain = searching_domain
-        self.max_retries = max_retries
-        self.waiting_seconds_if_error = waiting_seconds_if_error
-        self.max_concurrent = max_concurrent
-        self.store_response_text = store_response_text
-        self.fetch_resources = fetch_resources
-        self.store_resource_content = store_resource_content
+    def _rewrite_content(
+        self, text_content: str, content_type: str, base_url: str
+    ) -> str:
+        """根据内容类型，重写文本文件中的所有URL。"""
 
-        # 设置需要跳过的文件扩展名（移除了CSS、JS和图片文件）
-        self.skipped_extensions = (
-            ".mp4",
-            ".doc",
-            ".docx",
-            ".pdf",
-            ".xls",
-            ".xlsx",
-            ".ppt",
-            ".pptx",
-            ".zip",
-            ".rar",
-            ".7z",
-            ".exe",
-            ".apk",
-            ".ipa",
-            ".iso",
-            ".dmg",
-            ".msi",
-            ".deb",
-            ".rpm",
-            ".tgz",
-            ".bz2",
-            ".gz",
-            ".xz",
-            ".zst",
-            ".lzma",
-            ".lzo",
-            ".lz4",
-            ".lz",
-            ".z",
-            ".lzma2",
-            ".zstd",
-            ".zpaq",
-            ".arc",
-            ".arj",
-            ".cab",
-            ".chm",
-            ".cso",
-            ".cpio",
-            ".cramfs",
-            ".fat",
-            ".hfs",
-            ".hfsx",
-        )
+        def url_replacer_factory(original_url: str) -> str:
+            """核心的URL查找和替换逻辑"""
+            if not original_url or not isinstance(original_url, str): return original_url
+            absolute_url = urljoin(base_url, original_url)
+            return self.url_map.get(absolute_url, original_url)
 
-        self.target_urls: set[str] = {f"https://{searching_domain}"}
-        self.start_domain = urlparse((f'https://{searching_domain}'))
-        self.accessed_urls: set[str] = set()
-        self.results: list[CrawlResult] = []
-        self.resource_urls: set[str] = set()  # 存储需要获取的资源URL
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self._url_lock = asyncio.Lock()
-        self.url_map : dict[str, str] = {} # 资源的url映射
+        # --- HTML 和 CSS 的重写逻辑保持不变，它们工作得很好 ---
+        if "html" in content_type:
+            soup = BeautifulSoup(text_content, "lxml")
+            tags_to_rewrite = {
+                "a": "href", "link": "href", "script": "src", "img": "src",
+                "audio": "src", "video": "src", "source": "src", "iframe": "src",
+                "embed": "src", "object": "data", "form": "action",
+            }
+            for tag_name, attr in tags_to_rewrite.items():
+                for tag in soup.find_all(tag_name, **{attr: True}):
+                    tag[attr] = url_replacer_factory(tag[attr])
+            for tag in soup.find_all(srcset=True):
+                 parts = [p.strip().split() for p in tag['srcset'].split(',')]
+                 new_srcset = ", ".join([f"{url_replacer_factory(p[0])} {' '.join(p[1:])}" for p in parts if p])
+                 tag['srcset'] = new_srcset
+            return soup.prettify()
 
-    def process_html(self, html_content: str, baseurl: str):
+        if "css" in content_type:
+            pattern = re.compile(r"url\((.*?)\)", re.IGNORECASE)
+            def css_replacer(match: re.Match) -> str:
+                original = match.group(1).strip("'\"")
+                return f"url('{url_replacer_factory(original)}')"
+            return pattern.sub(css_replacer, text_content)
+
+        # --- 新的 JavaScript 重写逻辑 ---
+        if "javascript" in content_type:
+            replacements: List[Tuple[int, int, str]] = []
+
+            def visit_node(node):
+                """递归遍历AST节点"""
+                if not isinstance(node, dict): return
+                
+                # 检查当前节点是否是字符串字面量
+                if node.get('type') == 'Literal' and isinstance(node.get('value'), str):
+                    original_str = node['value']
+                    # 启发式判断是否为URL
+                    if '/' in original_str or ('.' in original_str and ' ' not in original_str):
+                        rewritten_url = url_replacer_factory(original_str)
+                        if rewritten_url != original_str:
+                            # 记录替换信息：(起始索引, 结束索引, 新的带引号的字符串)
+                            # pyjsparser的 'range' 包含了字符串引号，非常方便
+                            start, end = node['range']
+                            # 需要将新URL封装在引号里
+                            new_quoted_str = f'"{rewritten_url}"' 
+                            replacements.append((start, end, new_quoted_str))
+
+                # 递归遍历子节点
+                for key, value in node.items():
+                    if isinstance(value, dict):
+                        visit_node(value)
+                    elif isinstance(value, list):
+                        for item in value:
+                            visit_node(item)
+            
+            try:
+                # 1. 解析JS，带上range信息
+                ast = pyjsparser.parse(text_content, {'range': True})
+                # 2. 遍历AST，收集所有需要替换的位置
+                visit_node(ast)
+                
+                # 3. 如果有需要替换的内容，执行替换
+                if replacements:
+                    # 从后往前替换，避免索引失效
+                    replacements.sort(key=lambda x: x[0], reverse=True)
+                    new_js_parts = []
+                    last_index = len(text_content)
+                    for start, end, new_str in replacements:
+                        # 添加未被替换的后半部分
+                        new_js_parts.append(text_content[end:last_index])
+                        # 添加替换后的新字符串
+                        new_js_parts.append(new_str)
+                        last_index = start
+                    # 添加最开始未被替换的部分
+                    new_js_parts.append(text_content[:last_index])
+                    # 翻转并拼接
+                    return "".join(reversed(new_js_parts))
+                else:
+                    return text_content # 没有需要替换的，返回原文
+            except Exception as e:
+                logging.warning(f"pyjsparser解析JS失败({base_url}): {e}. 回退到正则。")
+                # 正则表达式作为后备方案
+                pattern = re.compile(r"""(["'])((?:/|https?://|\./|\.\./)[^"']+)\1""")
+                def js_replacer(match: re.Match) -> str:
+                    quote, original = match.groups()
+                    return f"{quote}{url_replacer_factory(original)}{quote}"
+                return pattern.sub(js_replacer, text_content)
+
+        return text_content
+
+    async def _handle_response(self, response: Response):
         """
-        主处理函数，解析、统计和重写HTML中的所有资源。
+        Playwright的响应处理器，在每次浏览器接收到响应时触发。
+        这是捕获阶段的核心。
         """
-        soup = BeautifulSoup(html_content, 'lxml')
-        resource_urls = set()
-        new_urls = set()
+        url = response.url
+        # 1. 过滤：只处理目标域名下的、http/https协议的URL
+        if not is_resource_file(url) and (not url.startswith("http") or urlparse(url).netloc != self.start_domain):
+            logging.info(f"忽略非资源跨域外链: {url}")
+            return
         
-        def add_url(url:str):
-            if is_resource_file(url):
-                resource_urls.add(urljoin(baseurl, url))
-            else:
-                new_urls.add(urljoin(baseurl, url))
+        # 2. 过滤：只处理目标路径下的URL
+        if not is_resource_file(url) and not urlparse(url).path.startswith(urlparse(self.start_url).path):
+            logging.info(f"忽略非资源外链: {url}")
+            return
 
-        # --- 1. 处理常见的HTML标签 ---
-        tag_attrs = {
-            'link': ['href'], 'script': ['src'], 'img': ['src', 'srcset'],
-            'audio': ['src'], 'video': ['src', 'poster'], 'source': ['src', 'srcset'],
-            'iframe': ['src'], 'embed': ['src'], 'object': ['data'],
+        async with self._lock:
+            # 防止重复处理同一个URL
+            if url in self.processed_urls:
+                return
+            self.processed_urls.add(url)
+            
+        zim_path = get_zim_path(url)
+        if not zim_path:
+            return
+            
+        logging.info(f"捕获到响应: {url} ({response.status})")
+
+        # 2. 建立映射：将原始URL与其ZIM路径关联起来
+        async with self._lock:
+            self.url_map[url] = zim_path
+
+        # 3. 获取响应内容并保存
+        try:
+            # 对于重定向，Playwright会自动处理，我们只需记录原始URL的映射即可
+            if 300 <= response.status < 400:
+                return
+            if response.status >= 400:
+                logging.warning(f"请求失败 {response.status}: {url}")
+                return
+
+            body = await response.body()
+            mimetype = response.headers.get("content-type", "").split(";")[0] or get_mimetype(url)
+            
+            result = CrawlResult(
+                url=url,
+                success=True,
+                status_code=response.status,
+                mimetype=mimetype,
+                content=body,
+                is_resource=is_resource_file(mimetype),
+            )
+            # 4. 存入结果字典
+            async with self._lock:
+                self.results[zim_path] = result
+
+        except Exception as e:
+            logging.error(f"处理响应失败 ({url}): {e}")
+            
+    async def _discover_links_and_queue(self, page: Page):
+        """在一个页面上查找所有<a>标签的链接，并加入队列"""
+        links = await page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
+        async with self._lock:
+            for link in links:
+                # 过滤并加入队列
+                if link and link.startswith("http") and urlparse(link).netloc == self.start_domain:
+                    if link not in self.processed_urls and link not in list(self.queue._queue):
+                        await self.queue.put(link)
+
+    async def _worker(self, context: BrowserContext):
+        """单个工作协程，负责从队列中取URL并访问"""
+        page = await context.new_page()
+        while True:
+            try:
+                url_to_process = await self.queue.get()
+                logging.info(f"Worker开始处理: {url_to_process}")
+                await page.goto(url_to_process, wait_until="networkidle", timeout=60000)
+                # 访问后，再次探索页面上的静态链接，以防万一
+                await self._discover_links_and_queue(page)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Worker处理页面失败 ({url_to_process}): {e}")
+            finally:
+                self.queue.task_done()
+        await page.close()
+
+
+    async def crawl(self):
+        """主爬取流程，协调所有工作"""
+        await self.queue.put(self.start_url)
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            context = await browser.new_context(
+                java_script_enabled=True,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36"
+            )
+            # 全局响应处理器，捕获所有请求
+            context.on("response", self._handle_response)
+            
+            # 创建一组并发的工作者
+            tasks = [asyncio.create_task(self._worker(context)) for _ in range(self.max_concurrent_pages)]
+
+            # 等待队列处理完毕
+            await self.queue.join()
+            
+            # 所有任务完成，取消工作者
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            await context.close()
+            await browser.close()
+
+        # --- 阶段二：内容重写 ---
+        logging.info(f"捕获完成，共{len(self.results)}个资源。开始内容重写...")
+        relative_url_map = {
+            original_url: f"/{zim_path}" 
+            for original_url, zim_path in self.url_map.items()
         }
+        url_map_json = json.dumps(relative_url_map, indent=2)
 
-        for tag_name, attrs in tag_attrs.items():
-            for tag in soup.find_all(tag_name):
-                for attr in attrs:
-                    if tag.has_attr(attr):
-                        original_url_attr = tag[attr]
-                        
-                        if attr == 'srcset':
-                            new_srcset_parts = []
-                            for part in original_url_attr.split(','):
-                                part = part.strip()
-                                if not part: continue
-                                url_part, *descriptor = part.split(None, 1)
-                                add_url(url_part)
-                                rewritten = rewrite_url(url_part, baseurl)
-                                new_srcset_parts.append(f"{rewritten} {' '.join(descriptor)}")
-                            tag[attr] = ', '.join(new_srcset_parts)
-                        else:
-                            add_url(original_url_attr)
-                            tag[attr] = rewrite_url(original_url_attr, baseurl)
+        # 2. 读取我们的Service Worker模板
+        try:
+            with open('sw_template.js', 'r', encoding='utf-8') as f:
+                sw_template = f.read()
+            # 将URL映射注入到SW模板中
+            self.sw_script_content = sw_template.replace(
+                'const URL_MAP = {};', 
+                f'const URL_MAP = {url_map_json};'
+            )
+        except FileNotFoundError:
+            logging.error("sw_template.js 未找到！Service Worker无法被注入。")
+            self.sw_script_content = ""
 
-        # --- 2. 处理CSS中的url() ---
-        def create_rewriter_callback(is_js=False):
-            def rewriter(match):
-                # JS正则可能捕获引号，CSS不会
-                group_index = 2 if is_js else 1
-                quote = match.group(1) if is_js else "'"
-                
-                original_url = match.group(group_index).strip("'\"")
-                add_url(original_url)
-                rewritten_url = rewrite_url(original_url, baseurl)
-                
-                if is_js:
-                    return f"{quote}{rewritten_url}{quote}"
-                else:
-                    return f"url('{rewritten_url}')"
-            return rewriter
-
-        for style_tag in soup.find_all('style'):
-            if style_tag.string:
-                style_tag.string = re.sub(r'url\((.*?)\)', create_rewriter_callback(), style_tag.string)
-
-        for tag in soup.find_all(style=True):
-            tag['style'] = re.sub(r'url\((.*?)\)', create_rewriter_callback(), tag['style'])
-
-        # --- 3. 处理JavaScript中的链接 (简单情况) ---
-        for script_tag in soup.find_all('script'):
-            if script_tag.string:
-                # 改进正则以更好地处理简单字符串
-                new_js = re.sub(r'(["\'])((?:/|https?://|./|../).*?)\1', create_rewriter_callback(is_js=True), script_tag.string)
-                script_tag.string = new_js
-        logging.info(f"在{baseurl}找到了{len(resource_urls)}个资源链接, {len(new_urls)}个页面链接")
-        return soup.prettify(), resource_urls, new_urls
-
-    def process_css_content(
-        self,
-        css_content: str, 
-        css_base_url: str, 
-    ) -> Tuple[str, Set[str], Set[str]]:
-        """
-        处理CSS内容，重写其中的链接，并返回重写后的内容和找到的原始URL列表。
-
-        Args:
-            css_content (str): 要处理的CSS代码字符串。
-            css_base_url (str): 该CSS文件的绝对URL，用于解析相对路径。
-
-        Returns:
-            Tuple[str, Set[str], Set[str]]: 
-                - 第一个元素是重写了所有链接后的新CSS内容。
-                - 第二个元素是在CSS中找到的所有资源URL（绝对路径形式）的列表。
-                - 第三个元素是在CSS中找到的所有页面URL（绝对路径形式）的列表。
-        """
-        
-        resource_urls = set()
-        new_urls = set()
-        
-        def add_url(url:str):
-            if is_resource_file(url):
-                resource_urls.add(urljoin(css_base_url, url))
-            else:
-                new_urls.add(urljoin(css_base_url, url))
-
-        # 1. 处理 @import "..." 或 @import url(...)
-        def import_replacer(match: re.Match) -> str:
-            # group(1) 匹配 url(...) 中的内容, group(2) 匹配 "..." 中的内容
-            original_url = (match.group(1) or match.group(2)).strip("'\"")
+        # 3. 遍历所有结果，进行重写和注入
+        for zim_path, result in self.results.items():
+            content_type = result.mimetype.lower()
+            is_text = "text" in content_type or "javascript" in content_type or "json" in content_type or "xml" in content_type
             
-            # 忽略空URL
-            if not original_url:
-                return match.group(0)
-
-            # 将相对URL转换为绝对URL
-            absolute_url = urljoin(css_base_url, original_url)
-            add_url(absolute_url)
-            
-            # 从 rewrite_map 中查找重写后的URL，如果找不到则保持原样
-            rewritten_url = rewrite_url(original_url, css_base_url)
-            
-            # 返回标准格式的 @import
-            return f'@import url("{rewritten_url}");'
-
-        # 正则表达式匹配 @import 规则
-        # @import url(path) or @import "path" or @import 'path'
-        import_pattern = re.compile(r'@import\s+(?:url\((.*?)\)|["\'](.*?)["\']);?', re.IGNORECASE)
-        modified_content = import_pattern.sub(import_replacer, css_content)
-
-        # 2. 处理 url(...)
-        def url_replacer(match: re.Match) -> str:
-            original_url = match.group(1).strip("'\"")
-
-            # 忽略空的、data: URI 或锚点
-            if not original_url or original_url.startswith(('data:', '#')):
-                return match.group(0)
-                
-            absolute_url = urljoin(css_base_url, original_url)
-            add_url(absolute_url)
-
-            rewritten_url = rewrite_url(original_url, css_base_url)
-            
-            # 返回标准格式的 url()
-            # 注意对URL中的特殊字符（如引号）进行转义，以防破坏CSS语法
-            escaped_rewritten_url = rewritten_url.replace('"', '\\"')
-            return f'url("{escaped_rewritten_url}")'
-
-        # 正则表达式匹配 url() 函数
-        url_pattern = re.compile(r'url\((.*?)\)', re.IGNORECASE)
-        modified_content = url_pattern.sub(url_replacer, modified_content)
-        logging.info(f"在{css_base_url}找到了{len(resource_urls)}个资源链接 {len(new_urls)}个页面链接")
-
-        return modified_content, resource_urls, new_urls
-
-    async def _process_single_url(
-        self, client: httpx.AsyncClient, url: str, is_resource: bool = False
-    ) -> None:
-        """处理单个URL的异步方法"""
-        async with self.semaphore:
-            # 检查是否已访问
-            async with self._url_lock:
-                if url in self.accessed_urls:
-                    return
-                self.accessed_urls.add(url)
-
-            if not is_resource:  # 只对网页做扩展名过滤
-                parsed_url = urlparse(url)
-                if os.path.splitext(parsed_url.path)[-1] in self.skipped_extensions:
-                    logging.info(f"跳过链接{url}")
-                    return
-
-            error = 0
-            response = None
-
-            while error < self.max_retries:
+            if result.content and is_text:
                 try:
-                    response = await client.get(url, follow_redirects=True)
-                    break
-                except Exception as e:
-                    error += 1
-                    logging.error(
-                        f"Error accessing {url}: {e.__class__.__name__}, attempt {error}/{self.max_retries}"
+                    text_content = result.content.decode("utf-8")
+                    
+                    # 首先，进行常规的静态URL重写
+                    rewritten_content = self._rewrite_content(
+                        text_content, content_type, result.url
                     )
 
-                    if error >= self.max_retries:
-                        if url.startswith("https://") and not is_resource:
-                            http_url = f"http://{url.removeprefix('https://')}"
-                            async with self._url_lock:
-                                if http_url not in self.accessed_urls:
-                                    self.target_urls.add(http_url)
-                            return
+                    # 如果是HTML页面，额外注入Service Worker注册脚本
+                    if "html" in content_type and self.sw_script_content:
+                        soup = BeautifulSoup(rewritten_content, "lxml")
+                        # 创建注入脚本
+                        sw_registration_script = soup.new_tag("script")
+                        sw_registration_script.string = """
+                        if ('serviceWorker' in navigator) {
+                            navigator.serviceWorker.register('/sw.js')
+                                .then(registration => console.log('ServiceWorker registration successful with scope: ', registration.scope))
+                                .catch(err => console.log('ServiceWorker registration failed: ', err));
+                        }
+                        """
+                        # 将脚本添加到body末尾
+                        if soup.body:
+                            soup.body.append(sw_registration_script)
                         else:
-                            # 记录最终失败
-                            result = CrawlResult(
-                                url=url,
-                                success=False,
-                                remark=(
-                                    "bad domain" if is_resource else "connection error"
-                                ),
-                                status_code=0,
-                                is_resource=is_resource,
-                            )
-                            async with self._url_lock:
-                                self.results.append(result)
-                            return
-                    else:
-                        await asyncio.sleep(self.waiting_seconds_if_error)
-            if response:
-                # 获取MIME类型
-                content_type = response.headers.get("content-type", "")
-                mimetype = (
-                    content_type.split(";")[0] if content_type else get_mimetype(url)
-                )
-
-                # 记录成功结果
-                remark = (
-                    "No HTTPS" if url.startswith("http://") else response.reason_phrase
-                )
-
-                # 资源文件和HTML页面的处理方式不同
-                if is_resource:
-                    # 资源文件保存二进制内容
-                    result = CrawlResult(
-                        url=url.replace('https://', '').replace('http://', ''),
-                        success=response.is_success,
-                        remark=remark,
-                        status_code=response.status_code,
-                        content=(
-                            response.content if self.store_resource_content else ""
-                        ),
-                        mimetype=mimetype,
-                        is_resource=True,
-                    )
-                    
-                    if(mimetype == 'text/css' or 'javascript' in mimetype):
-                        re_comment, new_resource_urls, new_urls = self.process_css_content(response.text, url)
-                        async with self._url_lock:
-                            # 只添加未访问的URL
-                            self.target_urls.update(new_urls - self.accessed_urls)
-                            # 添加新的资源URL
-                            self.resource_urls.update(
-                                new_resource_urls - self.accessed_urls
-                            )
-                        result.content = re_comment
-                else:
-
-                    # 提取新URL和资源URL
-                    re_comment, new_resource_urls, new_urls = self.process_html(response.text, url)
-                    
-                    result = CrawlResult(
-                        url=url,
-                        success=response.is_success,
-                        remark=remark,
-                        status_code=response.status_code,
-                        content=re_comment,  
-                        mimetype=mimetype,
-                        is_resource=False,
-                    )
-                    async with self._url_lock:
-                        # 只添加未访问的URL
-                        self.target_urls.update(new_urls - self.accessed_urls)
-                        # 添加新的资源URL
-                        self.resource_urls.update(
-                            new_resource_urls - self.accessed_urls
-                        )
+                            soup.append(sw_registration_script) # 如果没有body
                         
-                async with self._url_lock:
-                    self.results.append(result)
+                        rewritten_content = str(soup)
 
-    async def crawl(self) -> list[dict[str, Any]]:
-        """主要的爬虫方法"""
-        async with httpx.AsyncClient() as client:
-            # 第一阶段：爬取网页内容
-            while True:
-                # 获取当前批次的URL
-                async with self._url_lock:
-                    current_batch = list(self.target_urls - self.accessed_urls)
-                    if not current_batch:
-                        break
+                    result.content = rewritten_content.encode("utf-8")
+                except UnicodeDecodeError:
+                    logging.warning(f"解码失败，跳过重写: {result.url}")
 
-                # 批量处理URL，提高并发性
-                batch_size = min(len(current_batch), self.max_concurrent)
-                tasks = [
-                    self._process_single_url(client, url, is_resource=False)
-                    for url in current_batch[:batch_size]
-                ]
-
-                # 等待当前批次完成
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-                # 记录进度
-                async with self._url_lock:
-                    total_urls = len(self.target_urls) + len(self.accessed_urls)
-                    progress = (
-                        100 * len(self.accessed_urls) / total_urls
-                        if total_urls > 0
-                        else 0
-                    )
-                    logging.info(
-                        f"URLs: {progress:.2f}%, {len(self.accessed_urls)}/{total_urls}"
-                    )
-
-            # 第二阶段：爬取资源文件
-            if self.fetch_resources:
-                logging.info(
-                    f"Starting to fetch resource files: {len(self.resource_urls)} files"
-                )
-                resource_count = 0
-
-                # 批量处理资源URL
-                while True:
-                    async with self._url_lock:
-                        current_batch = list(self.resource_urls - self.accessed_urls)
-                        if not current_batch:
-                            break
-
-                    batch_size = min(len(current_batch), self.max_concurrent)
-                    tasks = [
-                        self._process_single_url(client, url, is_resource=True)
-                        for url in current_batch[:batch_size]
-                    ]
-
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-                    # 记录资源获取进度
-                    resource_count += batch_size
-                    logging.info(
-                        f"Resources: {resource_count}/{len(self.resource_urls)} files"
-                    )
-
-        logging.info("Finished crawling")
-        return [asdict(result) for result in self.results]
+        logging.info("内容重写和注入完成。")
 
     def save_to_zim(
-        self, output_file: str, title: str, description: str, creator_meta: str
-    ) -> bool:
-        """保存结果为ZIM格式
-
-        Args:
-            output_file: 输出的ZIM文件路径
-            title: ZIM文件标题
-            description: ZIM文件描述
-            creator_meta: 创建者信息
-
-        Returns:
-            bool: 保存是否成功
-        """
+        self, output_file: str, title: str, description: str, creator: str
+    ):
+        """将处理好的结果，连同我们自己的sw.js，一起保存为ZIM文件"""
+        logging.info(f"正在保存到 ZIM 文件: {output_file}")
+        if not globals().get('Creator'):
+            logging.error("libzim 未加载，无法保存 ZIM 文件。")
+            return
 
         try:
-            
-            zim_creator = Creator(Path(output_file))
-            
-            # 启动Creator上下文（所有操作必须在with块内完成）
-            with zim_creator as creator:
-                # === 必须在with块内设置元数据 ===
-                creator.set_mainpath("index.html")
-                creator.add_metadata("Title", title)
-                creator.add_metadata("Description", description)
-                creator.add_metadata("Creator", creator_meta)  # 避免变量名冲突
-                creator.add_metadata("Publisher", "SCP_Spider")
-                creator.add_metadata("Language", "zh")
+            with Creator(Path(output_file)) as zim_creator:
+                # ... (元数据设置与之前相同)
+                main_page_zim_path = get_zim_path(self.start_url)
+                zim_creator.set_mainpath(main_page_zim_path)
+                # ...
 
-                # 生成首页索引
-                index_content = "<html><head><title>爬虫结果索引</title></head><body>"
-                index_content += f"<h1>{title}</h1><p>{description}</p><hr/>"
-                index_content += "<h2>已爬取的页面</h2><ul>"
-                page_count = 0
-                file_count = 0
+                # 1. 添加所有捕获到的资源
+                for zim_path, result in self.results.items():
+                    if not result.success: continue
+                    item = Item(
+                        path=zim_path,
+                        title=result.url,
+                        mimetype=result.mimetype,
+                        contentprovider=StringProvider(result.content),
+                        hints={Hint.COMPRESS: True},
+                    )
+                    zim_creator.add_item(item)
 
-                # 处理所有结果
-                for result in self.results:
-                    if not result.success:
-                        logging.warning(
-                            f"请求失败 {result.url}: {result.remark}"
-                        )
-                        continue
+                # 2. 关键：添加我们自己生成的Service Worker文件
+                if hasattr(self, 'sw_script_content') and self.sw_script_content:
+                    sw_item = Item(
+                        path="sw.js", # 必须是根目录下的sw.js
+                        title="Service Worker",
+                        mimetype="application/javascript",
+                        contentprovider=StringProvider(self.sw_script_content.encode('utf-8')),
+                        hints={Hint.COMPRESS: True}
+                    )
+                    zim_creator.add_item(sw_item)
+                    logging.info("自定义 Service Worker (sw.js) 已添加到 ZIM 文件。")
 
-                    # 生成ZIM路径（与原逻辑相同）
-                    # parsed_url = urlparse(result.url)
-                    path = result.url.replace('https://', '').replace('http://', '')
-                    '''
-                    @https://www.openzim.org/wiki/ZIM_file_format path章节
-                    path中的特殊字符保持原样
-                    #和?进行转义
-                    '''
-                    path = unquote(path).replace('#', '%23').replace('?', '%3F').replace('&', '%26').replace('=', '%3D')
-                    # path = result.url.replace('https://', '').replace('http://', '')
-
-
-                    # 创建条目并添加
-                    item = Item()
-                    item.get_path = lambda: path
-                    item.get_contentprovider = lambda: StringProvider(result.content)
-                    item.get_title = lambda: result.url
-                    item.get_mimetype = lambda: result.mimetype
-                    item.get_hints = lambda: {Hint.COMPRESS: True}
-                    logging.info(f'生成路径：{item.get_path()}')
-                    creator.add_item(item)  # 在上下文中添加
-                    
-                    
-                    # 更新索引
-                    if result.is_resource:
-                        file_count += 1
-                        index_content += f'<li><a href="{item.get_path()}">{item.get_path()}</a></li>'
-                    else:
-                        page_count += 1
-                        index_content += f'<li><a href="{path}">{result.url}</a></li>'
-                    del item # 是的, 生命周期
-
-                index_content += "</ul></body></html>"
-
-                try:
-                    # 添加索引页
-                    index_content_provider = StringProvider(index_content)
-                    index_item = Item()
-                    index_item.get_path = lambda: f"index.html"
-                    index_item.get_title = lambda: "索引"
-                    index_item.get_mimetype = lambda: "text/html"
-                    index_item.get_contentprovider = lambda: index_content_provider
-                    index_item.get_hints = lambda: {Hint.FRONT_ARTICLE: True}
-                    creator.add_item(index_item)  # 在上下文中添加
-                except Exception as e:
-                    logging.error(f"索引已经存在: {e}")
-
-            # 上下文退出时会自动完成ZIM文件写入
-            logging.info(f"ZIM文件创建成功：{output_file}，包含{page_count}个页面和{file_count}个资源文件")
-            return True
+            logging.info(f"ZIM 文件创建成功: {output_file}")
         except Exception as e:
-            logging.error(f"创建ZIM文件失败：{e}")
-            traceback.print_exc()
-            return False
-
+            logging.error(f"创建ZIM文件失败: {e}", exc_info=True)
 
 async def main():
-    """主函数"""
-    #searching_domain = "scp-wiki-cn.wikidot.com/cytus-3"
-    searching_domain = "scp-wiki-cn.wikidot.com/scp-cn-3959"
+    """主执行函数"""
+    # --- 配置区 ---
+    START_URL = "https://scp-wiki-cn.wikidot.com/scp-cn-3959"
+    # START_URL = "https://www.douban.com/" # 也可以试试其他复杂的网站
+    CONCURRENT_PAGES = 5  # 并发打开的标签页数量，根据你的机器性能调整
+    # --- 配置区结束 ---
+
+    archiver = PlaywrightArchiver(START_URL, CONCURRENT_PAGES)
     
-    crawler = WebCrawler(
-        searching_domain=searching_domain.replace("https://", "").replace("http://", ""),
-        max_retries=3,
-        waiting_seconds_if_error=3.0,
-        max_concurrent=10,
-        store_response_text=True,
-        fetch_resources=True,
-        store_resource_content=True,
-    )
+    # 阶段一：抓取与捕获
+    await archiver.crawl()
 
-    results = await crawler.crawl()
-
-    # 尝试保存为ZIM文件
-    zim_filename = f"{searching_domain.replace(".", "_").replace(r'/', '_')}-{time.strftime('%Y-%m-%d_%H-%M-%S')}.zim"
-    crawler.save_to_zim(
+    # 阶段二：保存
+    domain = urlparse(START_URL).netloc
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    zim_filename = f"{domain.replace('.', '_')}_{timestamp}.zim"
+    
+    archiver.save_to_zim(
         output_file=zim_filename,
-        title=f"{searching_domain} 爬虫存档",
-        description=f"{searching_domain} 网站的离线存档, 由SCP_Spider创建",
-        creator_meta="SCP_Spider",
+        title=f"Archive of {domain}",
+        description=f"An offline archive of {START_URL} created on {timestamp}",
+        creator="Playwright Archiver",
     )
 
 
 if __name__ == "__main__":
+    # 确保你已经安装了必要的依赖:
+    # pip install playwright beautifulsoup4 slimit lxml libzim
+    # playwright install chromium
     asyncio.run(main())
